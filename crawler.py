@@ -1,5 +1,3 @@
-import xml.etree.ElementTree as ET
-import signal
 import time
 #!/usr/bin/env python3
 import argparse, asyncio, gzip, json, os, re, sqlite3, time
@@ -16,23 +14,6 @@ SKIP_EXTENSIONS={'.jpg','.jpeg','.png','.gif','.webp','.svg','.ico','.pdf','.zip
 TRACKING_PARAMS={'utm_source','utm_medium','utm_campaign','utm_term','utm_content','gclid','fbclid','yclid','msclkid'}
 COMMON_SITEMAPS=('/sitemap.xml','/sitemap_index.xml','/sitemap-index.xml','/sitemap/sitemap.xml')
 COMMON_HTML_SITEMAPS=('/sitemap/index.html','/sitemap.html','/sitemap/')
-
-CANCEL_REQUESTED = False
-
-def _request_cancel(signum, frame):
-    global CANCEL_REQUESTED
-    if not CANCEL_REQUESTED:
-        CANCEL_REQUESTED=True
-        print("\n[CANCEL] 終了要求を受信しました。新しいURL取得を停止し、再開用データを保存します。",flush=True)
-
-def install_signal_handlers():
-    for name in ("SIGTERM","SIGINT"):
-        sig=getattr(signal,name,None)
-        if sig is not None:
-            signal.signal(sig,_request_cancel)
-
-def cancellation_requested():
-    return CANCEL_REQUESTED
 
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def host_key(url): return re.sub(r'[^a-z0-9._-]+','_',urlparse(url).netloc.lower())
@@ -114,161 +95,31 @@ def parse_xml(data,url):
     root=DET.fromstring(data);kind=root.tag.rsplit('}',1)[-1].lower()
     return kind,[e.text.strip() for e in root.iter() if e.tag.rsplit('}',1)[-1].lower()=='loc' and e.text]
 async def discover_xml(session,start,robots,timeout,host,subs,keep,max_files):
-    """
-    Exhaustive sitemap discovery:
-    - robots.txt Sitemap entries
-    - common sitemap entry points
-    - recursively follows every sitemap index / nested sitemap
-    - records failed sitemap fetches
-    - deduplicates sitemap files and page URLs
-    """
-    from collections import deque
-
-    base=f"{urlparse(start).scheme or 'https'}://{urlparse(start).netloc}"
-    candidates=[]
-
-    # Sitemap declarations in robots.txt.
-    for line in (robots or "").splitlines():
-        if line.lower().startswith("sitemap:"):
-            u=line.split(":",1)[1].strip()
-            if u:
-                candidates.append(u)
-
-    # Common sitemap locations.
-    for path in (
-        "/sitemap.xml",
-        "/sitemap_index.xml",
-        "/sitemap-index.xml",
-        "/sitemap/sitemap.xml",
-        "/sitemap/index.xml",
-        "/wp-sitemap.xml",
-    ):
-        candidates.append(urljoin(base,path))
-
-    q=deque()
-    queued=set()
-    visited=set()
-    failed=[]
-    page_sources={}
-    sitemap_files=[]
-
-    def enqueue(u):
-        if not u:
-            return
-        u=urljoin(base,u.strip())
-        pu=urlparse(u)
-        if pu.scheme not in ("http","https"):
-            return
-        # Sitemap files must remain on the start host unless subdomains are allowed.
-        if not same_host(u,host,subs):
-            return
-        if u not in queued and u not in visited:
-            queued.add(u)
-            q.append(u)
-
-    for u in candidates:
-        enqueue(u)
-
-    print(f"[XML] sitemap entry candidates={len(q):,}",flush=True)
-
-    while q:
-        if cancellation_requested():
-            print("[CANCEL] XML探索の新規取得を停止します。",flush=True)
-            break
-
-        sm_url=q.popleft()
-        queued.discard(sm_url)
-        if sm_url in visited:
-            continue
-        visited.add(sm_url)
-
-        # max_files is a safety ceiling, not a normal stopping point.
-        if len(visited)>max_files:
-            print(f"[XML][WARN] sitemapファイル上限 {max_files:,} に到達しました。未確認={len(q):,}",flush=True)
-            break
-
+    base=f'{urlparse(start).scheme}://{urlparse(start).netloc}';q=[]
+    for u in robots_sitemaps(robots)+[urljoin(base,p) for p in COMMON_SITEMAPS]:
+        n=normalize_url(u,True)
+        if n and n not in q:q.append(n)
+    seen=set();files=[];sources={}
+    while q and len(seen)<max_files:
+        sm=q.pop(0)
+        if sm in seen:continue
+        seen.add(sm)
         try:
-            await lim.wait() if 'lim' in locals() else asyncio.sleep(0)
-        except Exception:
-            pass
+            r,b=await fetch(session,sm,timeout)
+            if r.status>=400:continue
+            kind,locs=parse_xml(b,sm)
+        except:continue
+        files.append(sm)
+        if kind=='sitemapindex':
+            for loc in locs:
+                n=normalize_url(loc,True)
+                if n and n not in seen:q.append(n)
+        elif kind=='urlset':
+            for loc in locs:
+                n=normalize_url(loc,keep)
+                if n and same_site(n,host,subs) and not skipped_extension(n):sources.setdefault(n,sm)
+    return files,sources
 
-        try:
-            async with session.get(sm_url,timeout=timeout,allow_redirects=True) as r:
-                status=r.status
-                raw=await r.read()
-                final_url=str(r.url)
-                ct=(r.headers.get("Content-Type") or "").lower()
-        except Exception as e:
-            failed.append((sm_url,str(e)))
-            print(f"[XML][FAIL] {sm_url} :: {e}",flush=True)
-            continue
-
-        if status>=400:
-            failed.append((sm_url,f"HTTP {status}"))
-            print(f"[XML][FAIL] {sm_url} :: HTTP {status}",flush=True)
-            continue
-
-        # gzip sitemap support.
-        if sm_url.lower().endswith(".gz") or "gzip" in ct:
-            try:
-                import gzip
-                raw=gzip.decompress(raw)
-            except Exception as e:
-                failed.append((sm_url,f"gzip: {e}"))
-                print(f"[XML][FAIL] {sm_url} :: gzip {e}",flush=True)
-                continue
-
-        try:
-            text=raw.decode("utf-8-sig",errors="replace")
-            root=ET.fromstring(text)
-        except Exception as e:
-            failed.append((sm_url,f"XML parse: {e}"))
-            print(f"[XML][FAIL] {sm_url} :: XML parse {e}",flush=True)
-            continue
-
-        sitemap_files.append(final_url)
-        tag=root.tag.lower()
-
-        # Namespace-agnostic loc extraction.
-        locs=[]
-        for elem in root.iter():
-            if elem.tag.lower().endswith("loc") and elem.text:
-                locs.append(elem.text.strip())
-
-        if tag.endswith("sitemapindex"):
-            before=len(q)
-            for child in locs:
-                enqueue(child)
-            print(f"[XML][INDEX] {sm_url} -> child={len(locs):,} / queue={len(q):,}",flush=True)
-        elif tag.endswith("urlset"):
-            added=0
-            for page in locs:
-                nu=normalize_url(page,keep_query=keep)
-                if nu and same_host(nu,host,subs):
-                    if nu not in page_sources:
-                        added+=1
-                    page_sources.setdefault(nu,sm_url)
-            print(f"[XML][URLSET] {sm_url} -> URLs={len(locs):,} / new={added:,} / total={len(page_sources):,}",flush=True)
-        else:
-            # Some sites return valid XML with a non-standard wrapper.
-            child_xml=[u for u in locs if re.search(r"(?i)(sitemap|\.xml(?:\.gz)?(?:$|\?))",u)]
-            page_like=[u for u in locs if u not in child_xml]
-            for child in child_xml:
-                enqueue(child)
-            for page in page_like:
-                nu=normalize_url(page,keep_query=keep)
-                if nu and same_host(nu,host,subs):
-                    page_sources.setdefault(nu,sm_url)
-            print(f"[XML][OTHER] {sm_url} -> childXML={len(child_xml):,} / URLs={len(page_like):,}",flush=True)
-
-    print(f"[XML] sitemap files checked={len(visited):,} success={len(sitemap_files):,} failed={len(failed):,}",flush=True)
-    print(f"[XML] unique page URLs={len(page_sources):,}",flush=True)
-    if q:
-        print(f"[XML][WARN] 未確認sitemap={len(q):,}",flush=True)
-    if failed:
-        print("[XML][WARN] 取得失敗したsitemapがあります。ログの [XML][FAIL] を確認してください。",flush=True)
-
-    return sitemap_files,page_sources
 def extract_links(html,base,host,subs,keep):
     soup=BeautifulSoup(html,'html.parser');out=[]
     for a in soup.find_all('a',href=True):
@@ -297,7 +148,6 @@ class RateLimiter:
     async def penalize(self,s):
         async with self.lock:self.penalty=max(self.penalty,time.monotonic()+s)
 async def get_html(session,url,sem,limiter,timeout,rp,robots_loaded,ua):
-    if cancellation_requested(): return None,None,'','cancelled','cancel requested'
     if robots_loaded and not rp.can_fetch(ua,url):return None,0,'','blocked','robots.txt'
     async with sem:
         await limiter.wait()
@@ -420,9 +270,6 @@ async def html_discovery(session,con,seeds,host,subs,keep,timeout,rp,robots_load
     processed=0
     started_at=time.monotonic()
     while processed<max_pages:
-        if cancellation_requested():
-            print('[CANCEL] HTML巡回の新規処理を停止します。',flush=True)
-            break
         rows=con.execute(
             "SELECT url,depth FROM html_queue WHERE state='pending' ORDER BY rowid LIMIT ?",
             (min(conc*4,max_pages-processed),)
@@ -432,8 +279,6 @@ async def html_discovery(session,con,seeds,host,subs,keep,timeout,rp,robots_load
             get_html(session,u,sem,lim,timeout,rp,robots_loaded,ua) for u,d in rows
         ])
         for (u,d),(html,code,ct,state,err) in zip(rows,res):
-            if state=='cancelled':
-                continue
             con.execute("UPDATE html_queue SET state='done' WHERE url=?",(u,))
             processed+=1
             if html is not None:
@@ -475,12 +320,6 @@ async def title_fetch(session,con,urls,timeout,rp,robots_loaded,ua,conc,rps,max_
     started_at=time.monotonic()
 
     while processed<max_pages:
-
-        if cancellation_requested():
-
-            print('[CANCEL] タイトル取得の新規処理を停止します。',flush=True)
-
-            break
         rows=con.execute(
             "SELECT url FROM title_queue WHERE state='pending' ORDER BY rowid LIMIT ?",
             (min(conc*4,max_pages-processed),)
@@ -494,8 +333,6 @@ async def title_fetch(session,con,urls,timeout,rp,robots_loaded,ua,conc,rps,max_
         ])
 
         for u,(html,code,ct,state,err) in zip(page_urls,res):
-            if state=='cancelled':
-                continue
             con.execute("UPDATE title_queue SET state='done' WHERE url=?",(u,))
             processed+=1
             if html is not None:
@@ -538,13 +375,12 @@ async def detail_fetch(session,con,timeout,rp,robots_loaded,ua,conc,rps,max_page
     return processed
 
 async def run(cfg,fresh=False):
-    install_signal_handlers()
     keep=bool(cfg.get('keep_query',False));target=normalize_url(os.environ.get('TARGET_URL') or cfg['target_url'],keep)
     collection=(os.environ.get('COLLECTION_MODE') or 'AUTO').upper();mode=(os.environ.get('OUTPUT_MODE') or 'URL_ONLY').upper()
     if collection not in ('AUTO','XML_ONLY','XML_TITLE','HTML_CRAWL') or mode not in ('URL_ONLY','DETAIL'):raise SystemExit('Mode が不正です')
     timeout=int(cfg.get('timeout_seconds',25));max_files=int(cfg.get('max_sitemap_files',1000));subs=bool(cfg.get('include_subdomains',False))
     respect=bool(cfg.get('respect_robots_txt',True));max_depth=int(cfg.get('max_depth',50));max_pages=int(cfg.get('max_html_pages_per_run',50000))
-    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.15 (+GitHub Actions)')
+    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.11 (+GitHub Actions)')
     state=Path(cfg.get('state_dir','state'));out=Path(cfg.get('output_dir','output'));host=urlparse(target).netloc.lower().split(':')[0];db=state/f'{host_key(target)}.sqlite3'
     if fresh:
         for fp in (db, Path(str(db)+'-wal'), Path(str(db)+'-shm')):
@@ -596,9 +432,6 @@ async def run(cfg,fresh=False):
         pending_work=con.execute("SELECT COUNT(*) FROM html_queue WHERE state='pending'").fetchone()[0]
         crawl_complete=(pending_work==0)
 
-    if cancellation_requested():
-        crawl_complete=False
-        print('[CANCEL] 再開用stateを保持します。',flush=True)
     write_completion_marker(host,collection,crawl_complete,pending_work)
     print(f'[STATE] complete={crawl_complete} pending={pending_work:,}',flush=True)
     print(f'[EXPORT] cumulative unique URLs = {unique_count(con):,}',flush=True)

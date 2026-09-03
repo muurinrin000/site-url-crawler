@@ -5,11 +5,11 @@
   "max_html_pages_per_run": 15000,
   "max_depth": 50,
   "timeout_seconds": 25,
-  "max_sitemap_files": 10000,
+  "max_sitemap_files": 1000,
   "include_subdomains": false,
   "keep_query": false,
   "respect_robots_txt": true,
-  "user_agent": "SiteURLCollector/3.15 (+GitHub Actions)",
+  "user_agent": "SiteURLCollector/3.11 (+GitHub Actions)",
   "state_dir": "state",
   "output_dir": "output"
 }
