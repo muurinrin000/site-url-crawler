@@ -24,7 +24,11 @@ def normalize_url(url,keep_query=False):
         if keep_query:
             pairs=[(k,v) for k,v in parse_qsl(p.query,keep_blank_values=True) if k.lower() not in TRACKING_PARAMS]
             q=urlencode(pairs,doseq=True)
-        return urlunparse((p.scheme.lower(),p.netloc.lower(),re.sub(r'/+','/',p.path or '/'),'',q,''))
+        scheme='https' if p.scheme.lower() in ('http','https') else p.scheme.lower()
+        path=re.sub(r'/+','/',p.path or '/')
+        # Keep trailing-slash differences as-is because /page and /page/
+        # can be different resources on some servers.
+        return urlunparse((scheme,p.netloc.lower(),path,'',q,''))
     except:return None
 def same_site(url,host,subs=False):
     h=urlparse(url).netloc.lower().split(':')[0]; return h==host or (subs and h.endswith('.'+host))
@@ -114,6 +118,10 @@ def extract_links(html,base,host,subs,keep):
         n=normalize_url(urljoin(base,h),keep)
         if n and same_site(n,host,subs) and not skipped_extension(n):out.append(n)
     return list(dict.fromkeys(out))
+def extract_title(html):
+    s=BeautifulSoup(html,'html.parser')
+    return ' '.join(s.title.get_text(' ',strip=True).split()) if s.title else ''
+
 def extract_detail(html,base):
     s=BeautifulSoup(html,'html.parser');title=' '.join(s.title.get_text(' ',strip=True).split()) if s.title else ''
     h=s.find('h1');h1=' '.join(h.get_text(' ',strip=True).split()) if h else ''
@@ -151,7 +159,7 @@ def print_summary(con,phase='',processed=None,remaining=None):
     if phase:print(f' {phase}',flush=True)
     print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',flush=True)
     print(f'XMLから発見        {x:>8,} URL',flush=True);print(f'HTMLから追加       {h:>8,} URL',flush=True)
-    print(f'重複除外           {d:>8,} URL',flush=True);print('────────────────────────────────',flush=True)
+    print(f'同一URLを再発見    {d:>8,} 回',flush=True);print('────────────────────────────────',flush=True)
     print(f'現在のユニークURL  {u:>8,} URL',flush=True)
     if phase=='DETAIL':
         pct=checked/max(u,1)*100
@@ -170,13 +178,13 @@ def print_summary(con,phase='',processed=None,remaining=None):
 def export_outputs(con,outdir,target,mode):
     outdir.mkdir(parents=True,exist_ok=True);key=host_key(target);df=pd.read_sql_query('SELECT * FROM urls ORDER BY rowid',con)
     if mode=='URL_ONLY':
-        out=df[['url','discovered_via','discovered_from','first_directory','second_directory']].copy()
-        out.columns=['URL','発見経路','発見元URL','第1階層','第2階層']
+        out=df[['url','title','discovered_via','discovered_from','first_directory','second_directory']].copy()
+        out.columns=['URL','ページタイトル','発見経路','発見元URL','第1階層','第2階層']
     else:
         out=df[['url','discovered_via','discovered_from','first_directory','second_directory','title','h1','status_code','canonical','content_type','detail_status','fetched_at','error']].copy()
         out.columns=['URL','発見経路','発見元URL','第1階層','第2階層','Title','H1','Status Code','Canonical','Content Type','詳細取得状態','取得日時','エラー']
     csv=outdir/f'{key}_{mode.lower()}.csv';xlsx=outdir/f'{key}_{mode.lower()}.xlsx';out.to_csv(csv,index=False,encoding='utf-8-sig')
-    summary=pd.DataFrame([['対象サイト',target],['出力モード',mode],['XMLから発見',via_count(con,'XML')],['HTMLから追加',via_count(con,'HTML')],['重複除外',meta_int(con,'duplicate_count')],['ユニークURL',unique_count(con)],['出力日時(UTC)',now_iso()]],columns=['項目','値'])
+    summary=pd.DataFrame([['対象サイト',target],['出力モード',mode],['XMLから発見',via_count(con,'XML')],['HTMLから追加',via_count(con,'HTML')],['同一URLを再発見',meta_int(con,'duplicate_count')],['ユニークURL',unique_count(con)],['出力日時(UTC)',now_iso()]],columns=['項目','値'])
     dirs=out.groupby('第1階層',dropna=False).size().reset_index(name='URL数').sort_values('URL数',ascending=False)
     with pd.ExcelWriter(xlsx,engine='openpyxl') as w:
         out.to_excel(w,index=False,sheet_name='URL一覧');summary.to_excel(w,index=False,sheet_name='集計');dirs.to_excel(w,index=False,sheet_name='第1階層集計')
@@ -197,12 +205,18 @@ async def html_discovery(session,con,seeds,host,subs,keep,timeout,rp,robots_load
         res=await asyncio.gather(*[get_html(session,u,sem,lim,timeout,rp,robots_loaded,ua) for u,d in batch])
         for (u,d),(html,code,ct,state,err) in zip(batch,res):
             processed+=1
-            if html is not None and d<max_depth:
-                rows=[]
-                for n in extract_links(html,u,host,subs,keep):
-                    rows.append((n,'HTML',u,d+1))
-                    if n not in seen:seen.add(n);q.append((n,d+1))
-                add_many(con,rows)
+            if html is not None:
+                # AUTO/HTML_CRAWL already downloaded this HTML, so keep its title
+                # without making any additional request.
+                con.execute('UPDATE urls SET title=?,status_code=?,content_type=?,fetched_at=? WHERE url=?',
+                            (extract_title(html),code,ct,now_iso(),u))
+                con.commit()
+                if d<max_depth:
+                    rows=[]
+                    for n in extract_links(html,u,host,subs,keep):
+                        rows.append((n,'HTML',u,d+1))
+                        if n not in seen:seen.add(n);q.append((n,d+1))
+                    add_many(con,rows)
         if processed%100<len(batch):print_summary(con,'URL COLLECTION',processed,len(q))
     return processed
 
@@ -226,7 +240,7 @@ async def run(cfg,fresh=False):
     if collection not in ('AUTO','XML_ONLY','HTML_CRAWL') or mode not in ('URL_ONLY','DETAIL'):raise SystemExit('Mode が不正です')
     timeout=int(cfg.get('timeout_seconds',25));max_files=int(cfg.get('max_sitemap_files',1000));subs=bool(cfg.get('include_subdomains',False))
     respect=bool(cfg.get('respect_robots_txt',True));max_depth=int(cfg.get('max_depth',50));max_pages=int(cfg.get('max_html_pages_per_run',50000))
-    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.1 (+GitHub Actions)')
+    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.3 (+GitHub Actions)')
     state=Path(cfg.get('state_dir','state'));out=Path(cfg.get('output_dir','output'));host=urlparse(target).netloc.lower().split(':')[0];db=state/f'{host_key(target)}.sqlite3'
     if fresh and db.exists():db.unlink()
     con=init_db(db);add_many(con,[(target,'HTML','START',0)])
