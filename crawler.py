@@ -1,3 +1,4 @@
+import xml.etree.ElementTree as ET
 import signal
 import time
 #!/usr/bin/env python3
@@ -113,31 +114,161 @@ def parse_xml(data,url):
     root=DET.fromstring(data);kind=root.tag.rsplit('}',1)[-1].lower()
     return kind,[e.text.strip() for e in root.iter() if e.tag.rsplit('}',1)[-1].lower()=='loc' and e.text]
 async def discover_xml(session,start,robots,timeout,host,subs,keep,max_files):
-    base=f'{urlparse(start).scheme}://{urlparse(start).netloc}';q=[]
-    for u in robots_sitemaps(robots)+[urljoin(base,p) for p in COMMON_SITEMAPS]:
-        n=normalize_url(u,True)
-        if n and n not in q:q.append(n)
-    seen=set();files=[];sources={}
-    while q and len(seen)<max_files:
-        sm=q.pop(0)
-        if sm in seen:continue
-        seen.add(sm)
-        try:
-            r,b=await fetch(session,sm,timeout)
-            if r.status>=400:continue
-            kind,locs=parse_xml(b,sm)
-        except:continue
-        files.append(sm)
-        if kind=='sitemapindex':
-            for loc in locs:
-                n=normalize_url(loc,True)
-                if n and n not in seen:q.append(n)
-        elif kind=='urlset':
-            for loc in locs:
-                n=normalize_url(loc,keep)
-                if n and same_site(n,host,subs) and not skipped_extension(n):sources.setdefault(n,sm)
-    return files,sources
+    """
+    Exhaustive sitemap discovery:
+    - robots.txt Sitemap entries
+    - common sitemap entry points
+    - recursively follows every sitemap index / nested sitemap
+    - records failed sitemap fetches
+    - deduplicates sitemap files and page URLs
+    """
+    from collections import deque
 
+    base=f"{urlparse(target).scheme or 'https'}://{urlparse(target).netloc}"
+    candidates=[]
+
+    # Sitemap declarations in robots.txt.
+    for line in (robots_text or "").splitlines():
+        if line.lower().startswith("sitemap:"):
+            u=line.split(":",1)[1].strip()
+            if u:
+                candidates.append(u)
+
+    # Common sitemap locations.
+    for path in (
+        "/sitemap.xml",
+        "/sitemap_index.xml",
+        "/sitemap-index.xml",
+        "/sitemap/sitemap.xml",
+        "/sitemap/index.xml",
+        "/wp-sitemap.xml",
+    ):
+        candidates.append(urljoin(base,path))
+
+    q=deque()
+    queued=set()
+    visited=set()
+    failed=[]
+    page_sources={}
+    sitemap_files=[]
+
+    def enqueue(u):
+        if not u:
+            return
+        u=urljoin(base,u.strip())
+        pu=urlparse(u)
+        if pu.scheme not in ("http","https"):
+            return
+        # Sitemap files must remain on the target host unless subdomains are allowed.
+        if not same_host(u,host,subs):
+            return
+        if u not in queued and u not in visited:
+            queued.add(u)
+            q.append(u)
+
+    for u in candidates:
+        enqueue(u)
+
+    print(f"[XML] sitemap entry candidates={len(q):,}",flush=True)
+
+    while q:
+        if cancellation_requested():
+            print("[CANCEL] XML探索の新規取得を停止します。",flush=True)
+            break
+
+        sm_url=q.popleft()
+        queued.discard(sm_url)
+        if sm_url in visited:
+            continue
+        visited.add(sm_url)
+
+        # max_files is a safety ceiling, not a normal stopping point.
+        if len(visited)>max_files:
+            print(f"[XML][WARN] sitemapファイル上限 {max_files:,} に到達しました。未確認={len(q):,}",flush=True)
+            break
+
+        try:
+            await lim.wait() if 'lim' in locals() else asyncio.sleep(0)
+        except Exception:
+            pass
+
+        try:
+            async with session.get(sm_url,timeout=timeout,allow_redirects=True) as r:
+                status=r.status
+                raw=await r.read()
+                final_url=str(r.url)
+                ct=(r.headers.get("Content-Type") or "").lower()
+        except Exception as e:
+            failed.append((sm_url,str(e)))
+            print(f"[XML][FAIL] {sm_url} :: {e}",flush=True)
+            continue
+
+        if status>=400:
+            failed.append((sm_url,f"HTTP {status}"))
+            print(f"[XML][FAIL] {sm_url} :: HTTP {status}",flush=True)
+            continue
+
+        # gzip sitemap support.
+        if sm_url.lower().endswith(".gz") or "gzip" in ct:
+            try:
+                import gzip
+                raw=gzip.decompress(raw)
+            except Exception as e:
+                failed.append((sm_url,f"gzip: {e}"))
+                print(f"[XML][FAIL] {sm_url} :: gzip {e}",flush=True)
+                continue
+
+        try:
+            text=raw.decode("utf-8-sig",errors="replace")
+            root=ET.fromstring(text)
+        except Exception as e:
+            failed.append((sm_url,f"XML parse: {e}"))
+            print(f"[XML][FAIL] {sm_url} :: XML parse {e}",flush=True)
+            continue
+
+        sitemap_files.append(final_url)
+        tag=root.tag.lower()
+
+        # Namespace-agnostic loc extraction.
+        locs=[]
+        for elem in root.iter():
+            if elem.tag.lower().endswith("loc") and elem.text:
+                locs.append(elem.text.strip())
+
+        if tag.endswith("sitemapindex"):
+            before=len(q)
+            for child in locs:
+                enqueue(child)
+            print(f"[XML][INDEX] {sm_url} -> child={len(locs):,} / queue={len(q):,}",flush=True)
+        elif tag.endswith("urlset"):
+            added=0
+            for page in locs:
+                nu=normalize_url(page,keep_query=keep)
+                if nu and same_host(nu,host,subs):
+                    if nu not in page_sources:
+                        added+=1
+                    page_sources.setdefault(nu,sm_url)
+            print(f"[XML][URLSET] {sm_url} -> URLs={len(locs):,} / new={added:,} / total={len(page_sources):,}",flush=True)
+        else:
+            # Some sites return valid XML with a non-standard wrapper.
+            child_xml=[u for u in locs if re.search(r"(?i)(sitemap|\.xml(?:\.gz)?(?:$|\?))",u)]
+            page_like=[u for u in locs if u not in child_xml]
+            for child in child_xml:
+                enqueue(child)
+            for page in page_like:
+                nu=normalize_url(page,keep_query=keep)
+                if nu and same_host(nu,host,subs):
+                    page_sources.setdefault(nu,sm_url)
+            print(f"[XML][OTHER] {sm_url} -> childXML={len(child_xml):,} / URLs={len(page_like):,}",flush=True)
+
+    print(f"[XML] sitemap files checked={len(visited):,} success={len(sitemap_files):,} failed={len(failed):,}",flush=True)
+    print(f"[XML] unique page URLs={len(page_sources):,}",flush=True)
+    if q:
+        print(f"[XML][WARN] 未確認sitemap={len(q):,}",flush=True)
+    if failed:
+        print("[XML][WARN] 取得失敗したsitemapがあります。ログの [XML][FAIL] を確認してください。",flush=True)
+
+    return sitemap_files,page_sources
 def extract_links(html,base,host,subs,keep):
     soup=BeautifulSoup(html,'html.parser');out=[]
     for a in soup.find_all('a',href=True):
@@ -413,7 +544,7 @@ async def run(cfg,fresh=False):
     if collection not in ('AUTO','XML_ONLY','XML_TITLE','HTML_CRAWL') or mode not in ('URL_ONLY','DETAIL'):raise SystemExit('Mode が不正です')
     timeout=int(cfg.get('timeout_seconds',25));max_files=int(cfg.get('max_sitemap_files',1000));subs=bool(cfg.get('include_subdomains',False))
     respect=bool(cfg.get('respect_robots_txt',True));max_depth=int(cfg.get('max_depth',50));max_pages=int(cfg.get('max_html_pages_per_run',50000))
-    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.12 (+GitHub Actions)')
+    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.13 (+GitHub Actions)')
     state=Path(cfg.get('state_dir','state'));out=Path(cfg.get('output_dir','output'));host=urlparse(target).netloc.lower().split(':')[0];db=state/f'{host_key(target)}.sqlite3'
     if fresh:
         for fp in (db, Path(str(db)+'-wal'), Path(str(db)+'-shm')):

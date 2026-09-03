@@ -217,3 +217,21 @@ ActionsのCollection mode初期値は `XML_TITLE` に変更しています。
 
 ## v3.12 — キャンセル時の安全終了
 GitHub Actionsの終了要求を検知すると、新しいURL取得を止め、未処理URLをpendingのまま残し、再開用stateを保持します。次回は同じTarget URL・同じCollection mode・Fresh start=OFFで再開できます。
+
+
+## v3.13 — XML完全探索強化版
+
+XML取得を最優先で網羅するように強化しました。
+
+- robots.txt の `Sitemap:` をすべて起点として利用
+- `/sitemap.xml`、`/sitemap_index.xml`、`/sitemap-index.xml`、`/sitemap/sitemap.xml`、`/sitemap/index.xml`、`/wp-sitemap.xml` も確認
+- sitemap index → 子XML → 孫XML以降をキューで再帰的にすべて探索
+- `.xml.gz` に対応
+- XML名前空間に依存せず `<loc>` を取得
+- sitemapファイル上限を1,000 → 10,000へ拡大
+- sitemapごとにURL件数・追加件数をログ表示
+- 取得失敗したXMLは `[XML][FAIL]` で明示
+- 最後に「確認XML数 / 成功 / 失敗 / ユニークURL数」を表示
+- v3.12のキャンセル安全終了、途中再開、完了済みstate自動削除、4モードは維持
+
+`XML_ONLY / XML_TITLE / AUTO` は、まずこのXML探索を完了してから次工程へ進みます。
