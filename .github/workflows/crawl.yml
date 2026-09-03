@@ -1,24 +1,30 @@
 name: Site URL Collector
+
 on:
   workflow_dispatch:
     inputs:
       target_url:
         description: "Target URL"
         required: true
-        default: "https://www.insource.co.jp/"
+        default: ""
         type: string
       collection_mode:
         description: "Collection mode"
         required: true
         default: "AUTO"
         type: choice
-        options: [AUTO, XML_ONLY, HTML_CRAWL]
+        options:
+          - AUTO
+          - XML_ONLY
+          - HTML_CRAWL
       output_mode:
         description: "Output mode"
         required: true
         default: "URL_ONLY"
         type: choice
-        options: [URL_ONLY, DETAIL]
+        options:
+          - URL_ONLY
+          - DETAIL
       concurrency:
         description: "同時処理数（推奨6）"
         required: true
@@ -34,22 +40,91 @@ on:
         required: true
         default: false
         type: boolean
+
 permissions:
   contents: write
+
 concurrency:
   group: site-url-crawler
   cancel-in-progress: false
+
 jobs:
-  crawl:
+  xml-preview:
+    if: ${{ inputs.collection_mode == 'AUTO' || inputs.collection_mode == 'XML_ONLY' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with: {fetch-depth: 0}
+
       - uses: actions/setup-python@v5
-        with: {python-version: "3.12", cache: "pip"}
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Collect XML URLs only
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+          COLLECTION_MODE: XML_ONLY
+          OUTPUT_MODE: URL_ONLY
+          CONCURRENCY: ${{ inputs.concurrency }}
+          REQUESTS_PER_SECOND: ${{ inputs.requests_per_second }}
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          cfg=json.loads(Path("config.json").read_text(encoding="utf-8"))
+          cfg["state_dir"]="preview_state"
+          cfg["output_dir"]="preview_output"
+          Path("preview_config.json").write_text(json.dumps(cfg,ensure_ascii=False,indent=2),encoding="utf-8")
+          PY
+          python -u crawler.py --config preview_config.json --fresh
+
+      - name: Prepare XML preview artifact
+        id: xmlmeta
+        shell: bash
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+        run: |
+          HOST=$(python - <<'PY'
+          from urllib.parse import urlparse
+          import os
+          print(urlparse(os.environ["TARGET_URL"].strip()).netloc or "site")
+          PY
+          )
+          mkdir -p xml_preview_download
+          cp "preview_output/${HOST}_url_only.xlsx" xml_preview_download/
+          cp "preview_output/${HOST}_url_only.csv" xml_preview_download/
+          echo "artifact_name=${HOST}_XML発見URL_速報版" >> "$GITHUB_OUTPUT"
+
+      - name: Upload XML-only Excel / CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.xmlmeta.outputs.artifact_name }}
+          path: xml_preview_download/
+          if-no-files-found: error
+          retention-days: 30
+
+  crawl:
+    needs: xml-preview
+    if: ${{ always() && inputs.collection_mode != 'XML_ONLY' && (needs.xml-preview.result == 'success' || needs.xml-preview.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
       - name: Collect URLs
         env:
           TARGET_URL: ${{ inputs.target_url }}
@@ -58,21 +133,53 @@ jobs:
           CONCURRENCY: ${{ inputs.concurrency }}
           REQUESTS_PER_SECOND: ${{ inputs.requests_per_second }}
         run: |
-          if [ "${{ inputs.fresh_start }}" = "true" ]; then python -u crawler.py --fresh; else python -u crawler.py; fi
+          if [ "${{ inputs.fresh_start }}" = "true" ]; then
+            python -u crawler.py --fresh
+          else
+            python -u crawler.py
+          fi
+
+      - name: Prepare current-run artifact
+        if: always()
+        id: meta
+        shell: bash
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+          OUTPUT_MODE: ${{ inputs.output_mode }}
+        run: |
+          HOST=$(python - <<'PY'
+          from urllib.parse import urlparse
+          import os
+          print(urlparse(os.environ["TARGET_URL"].strip()).netloc or "site")
+          PY
+          )
+          MODE=$(echo "$OUTPUT_MODE" | tr '[:upper:]' '[:lower:]')
+          rm -rf run_output
+          mkdir -p run_output
+          cp "output/${HOST}_${MODE}.xlsx" run_output/ 2>/dev/null || true
+          cp "output/${HOST}_${MODE}.csv" run_output/ 2>/dev/null || true
+          echo "artifact_name=${HOST}_URL調査結果" >> "$GITHUB_OUTPUT"
+
       - name: Upload Excel / CSV
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: site-url-output-${{ github.run_number }}
-          path: |
-            output/*.xlsx
-            output/*.csv
-          if-no-files-found: warn
-          retention-days: 7
+          name: ${{ steps.meta.outputs.artifact_name }}
+          path: run_output/
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Save crawl state
         if: always()
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state
-          if git diff --cached --quiet; then echo "No state changes."; else git commit -m "chore: save crawler state [skip ci]" && git push; fi
+          git add state/
+          if git diff --cached --quiet; then
+            echo "No state changes to save."
+            exit 0
+          fi
+          git commit -m "Update crawl state"
+          git pull --rebase origin main || true
+          git push origin HEAD:main

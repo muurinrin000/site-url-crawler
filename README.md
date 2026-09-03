@@ -61,3 +61,99 @@ URL_ONLYのExcel列:
 - 末尾スラッシュの自動統一を撤回しました。
 - `/page` と `/page/` はサーバーによって別ページの可能性があるため、収集段階では別URLとして保持します。
 - `http → https` の統一、追跡パラメータ除去、fragment除去、正規化後の完全一致URL重複除外は継続します。
+
+
+## v3.4 の変更点
+
+### Actions の Target URL
+- `https://www.insource.co.jp/` のデフォルト入力を削除しました。
+- Target URL は毎回空欄から入力します。
+
+### Artifact のダウンロード内容
+- 過去の output フォルダ全体は Artifact に含めません。
+- 今回の実行で生成された対象サイトの Excel / CSV だけを `run_output/` にコピーしてアップロードします。
+- 過去の output や state は GitHub 側に残しても、ダウンロード用 ZIP には混在しません。
+
+### Artifact 名
+- `site-url-output-123` のような名前ではなく、
+  `<対象ホスト名>_URL調査結果`
+  の形式にしました。
+- 例: `school.recruit-ms.co.jp_URL調査結果`
+
+
+## v3.5 の変更点
+
+URL収集のリアルタイム進捗に以下を追加しました。
+
+- 経過時間
+- 処理速度（ページ/秒）
+- 残り時間の目安
+- 完了予想時刻（JST）
+
+AUTO / HTML_CRAWL では巡回中に新しいURLが追加されるため、残り時間と完了予想は推定値です。
+
+
+## v3.6 の変更点 — 大規模サイトの分割・再開対応
+
+- HTML巡回キューをSQLiteに保存します。
+- 各ページ処理後に進捗を保存します。
+- 1回のHTML巡回上限を15,000ページに設定しました。
+- 未処理が残った場合は残件数をログ表示します。
+- 次回 `Fresh start = OFF` で、未処理キューの続きから再開します。
+- `Fresh start = ON` は最初からやり直します。
+- 各回終了時点のExcel/CSVをArtifactへアップロードします。
+
+推奨:
+1. 初回 `AUTO + URL_ONLY + Fresh start ON`
+2. 未処理が残ったら `AUTO + URL_ONLY + Fresh start OFF`
+3. `HTML巡回は完了しました。` が出るまで必要に応じて繰り返す
+
+
+## v3.7 の変更点 — 累積URL出力の修正
+
+v3.6で一部実行時に、Excel/CSVへ「今回処理した一部URL」しか出ない可能性があった点を修正しました。
+
+### 重要な仕様
+- XMLで発見したURLは、HTML巡回前に必ず全件を累積URL DBへ登録します。
+- `max_html_pages_per_run = 15000` は「今回HTMLを確認するページ数」の上限だけです。
+- Excel/CSVの件数上限ではありません。
+- AUTOでは、現在DBに存在する全URLをHTML巡回キュー候補に入れます。
+- 既に処理済みのURLは `html_queue` の状態で再処理されません。
+- Fresh start OFFでは、前回までのURLを保持したまま続きから巡回します。
+- Fresh start ONでは、そのサイトのDBを完全に作り直します。
+- 出力直前に `[EXPORT] cumulative unique URLs = ...` をログへ表示します。
+
+### 期待される例
+XMLで 29,285 URL 発見し、今回HTMLで 1,200 URL 追加した場合、
+HTML巡回が15,000ページで区切られても、Excel/CSVには約30,485件の累積URLが出力されます。
+
+### 推奨運用
+初回:
+`AUTO + URL_ONLY + Fresh start ON`
+
+続き:
+`AUTO + URL_ONLY + Fresh start OFF`
+
+ログの `[EXPORT] cumulative unique URLs` と、Excelの行数が一致しているか確認してください。
+
+
+## v3.8 の変更点 — XML発見URLの速報ダウンロード
+
+AUTOで実行すると、最初に `xml-preview` ジョブだけが動きます。
+
+1. XMLサイトマップからURLを収集
+2. XMLで見つかったURLだけのExcel / CSVを作成
+3. `＜対象ホスト＞_XML発見URL_速報版` というArtifactをアップロード
+4. `xml-preview` ジョブ完了後、本番のHTML巡回を開始
+
+そのため、HTML巡回が数時間続いていても、XML分だけは先にダウンロードできます。
+
+例:
+- `www.insource.co.jp_XML発見URL_速報版`
+- 中身: `www.insource.co.jp_url_only.xlsx` / `.csv`
+
+### 注意
+- 速報版はXMLサイトマップで見つかったURLのみです。
+- ページタイトルは基本的に空欄です（各ページHTMLへアクセスしないため）。
+- AUTOの最終Artifactには、HTML巡回で追加発見したURLや取得できたページタイトルも含まれます。
+- XML_ONLYを選んだ場合は速報版だけ作成し、HTML巡回ジョブは実行しません。

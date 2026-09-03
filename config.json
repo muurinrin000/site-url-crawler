@@ -2,14 +2,14 @@
   "target_url": "https://www.insource.co.jp/",
   "concurrency": 6,
   "requests_per_second": 1.5,
-  "max_html_pages_per_run": 50000,
+  "max_html_pages_per_run": 15000,
   "max_depth": 50,
   "timeout_seconds": 25,
   "max_sitemap_files": 1000,
   "include_subdomains": false,
   "keep_query": false,
   "respect_robots_txt": true,
-  "user_agent": "SiteURLCollector/3.3 (+GitHub Actions)",
+  "user_agent": "SiteURLCollector/3.8 (+GitHub Actions)",
   "state_dir": "state",
   "output_dir": "output"
 }

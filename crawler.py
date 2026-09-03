@@ -47,6 +47,11 @@ def init_db(path):
     status_code INTEGER DEFAULT 0, canonical TEXT DEFAULT '', content_type TEXT DEFAULT '',
     fetched_at TEXT DEFAULT '', error TEXT DEFAULT '')''')
     con.execute('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT)')
+    con.execute('''CREATE TABLE IF NOT EXISTS html_queue(
+        url TEXT PRIMARY KEY,
+        depth INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL DEFAULT 'pending'
+    )''')
     con.commit(); return con
 def meta_int(con,key):
     r=con.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone(); return int(r[0]) if r else 0
@@ -152,7 +157,7 @@ async def get_html(session,url,sem,limiter,timeout,rp,robots_loaded,ua):
 
 def bar(p,w=10):
     n=max(0,min(w,round(w*p/100)));return '█'*n+'░'*(w-n)
-def print_summary(con,phase='',processed=None,remaining=None):
+def print_summary(con,phase='',processed=None,remaining=None,started_at=None):
     x=via_count(con,'XML');h=via_count(con,'HTML');u=unique_count(con);d=meta_int(con,'duplicate_count')
     checked=con.execute("SELECT COUNT(*) FROM urls WHERE detail_status!='not_checked'").fetchone()[0]
     print('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',flush=True)
@@ -173,6 +178,14 @@ def print_summary(con,phase='',processed=None,remaining=None):
         print(f'今回HTML確認        {processed:>8,} ページ',flush=True)
         print(f'HTML確認待ち        {rem:>8,} ページ',flush=True)
         print(f'進捗  {bar(pct)}  {pct:5.1f}%',flush=True)
+        if started_at is not None:
+            elapsed=max(time.monotonic()-started_at,0.001)
+            speed=processed/elapsed if processed>0 else 0.0
+            eta=(rem/speed) if speed>0 else None
+            print(f'経過時間            {format_duration(elapsed)}',flush=True)
+            print(f'処理速度            {speed:.2f} ページ/秒',flush=True)
+            print(f'残り時間の目安      約{format_duration(eta)}' if eta is not None else '残り時間の目安      計算中',flush=True)
+            print(f'完了予想            {eta_clock(eta)}' if eta is not None else '完了予想            計算中',flush=True)
     print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',flush=True)
 
 def export_outputs(con,outdir,target,mode):
@@ -196,28 +209,48 @@ def export_outputs(con,outdir,target,mode):
     return xlsx,csv
 
 async def html_discovery(session,con,seeds,host,subs,keep,timeout,rp,robots_loaded,ua,conc,rps,max_pages,max_depth):
-    sem=asyncio.Semaphore(conc);lim=RateLimiter(rps);q=[];seen=set()
+    sem=asyncio.Semaphore(conc);lim=RateLimiter(rps)
     for u,d in seeds:
-        if u not in seen:q.append((u,d));seen.add(u)
+        con.execute("INSERT OR IGNORE INTO html_queue(url,depth,state) VALUES(?,?,'pending')",(u,d))
+    con.commit()
     processed=0
-    while q and processed<max_pages:
-        batch=q[:conc*4];q=q[len(batch):]
-        res=await asyncio.gather(*[get_html(session,u,sem,lim,timeout,rp,robots_loaded,ua) for u,d in batch])
-        for (u,d),(html,code,ct,state,err) in zip(batch,res):
+    started_at=time.monotonic()
+    while processed<max_pages:
+        rows=con.execute(
+            "SELECT url,depth FROM html_queue WHERE state='pending' ORDER BY rowid LIMIT ?",
+            (min(conc*4,max_pages-processed),)
+        ).fetchall()
+        if not rows: break
+        res=await asyncio.gather(*[
+            get_html(session,u,sem,lim,timeout,rp,robots_loaded,ua) for u,d in rows
+        ])
+        for (u,d),(html,code,ct,state,err) in zip(rows,res):
+            con.execute("UPDATE html_queue SET state='done' WHERE url=?",(u,))
             processed+=1
             if html is not None:
-                # AUTO/HTML_CRAWL already downloaded this HTML, so keep its title
-                # without making any additional request.
-                con.execute('UPDATE urls SET title=?,status_code=?,content_type=?,fetched_at=? WHERE url=?',
-                            (extract_title(html),code,ct,now_iso(),u))
-                con.commit()
+                con.execute(
+                    'UPDATE urls SET title=?,status_code=?,content_type=?,fetched_at=? WHERE url=?',
+                    (extract_title(html),code,ct,now_iso(),u)
+                )
                 if d<max_depth:
-                    rows=[]
+                    discovered=[]
                     for n in extract_links(html,u,host,subs,keep):
-                        rows.append((n,'HTML',u,d+1))
-                        if n not in seen:seen.add(n);q.append((n,d+1))
-                    add_many(con,rows)
-        if processed%100<len(batch):print_summary(con,'URL COLLECTION',processed,len(q))
+                        discovered.append((n,'HTML',u,d+1))
+                        con.execute(
+                            "INSERT OR IGNORE INTO html_queue(url,depth,state) VALUES(?,?,'pending')",
+                            (n,d+1)
+                        )
+                    add_many(con,discovered)
+            con.commit()
+        pending=con.execute("SELECT COUNT(*) FROM html_queue WHERE state='pending'").fetchone()[0]
+        if processed%100<len(rows):
+            print_summary(con,'URL COLLECTION',processed,pending,started_at)
+    pending=con.execute("SELECT COUNT(*) FROM html_queue WHERE state='pending'").fetchone()[0]
+    print_summary(con,'URL COLLECTION',processed,pending,started_at)
+    if pending:
+        print(f'今回の巡回上限に到達。残り {pending:,} ページは Fresh start OFF で続きから再開できます。',flush=True)
+    else:
+        print('HTML巡回は完了しました。',flush=True)
     return processed
 
 async def detail_fetch(session,con,timeout,rp,robots_loaded,ua,conc,rps,max_pages):
@@ -240,27 +273,40 @@ async def run(cfg,fresh=False):
     if collection not in ('AUTO','XML_ONLY','HTML_CRAWL') or mode not in ('URL_ONLY','DETAIL'):raise SystemExit('Mode が不正です')
     timeout=int(cfg.get('timeout_seconds',25));max_files=int(cfg.get('max_sitemap_files',1000));subs=bool(cfg.get('include_subdomains',False))
     respect=bool(cfg.get('respect_robots_txt',True));max_depth=int(cfg.get('max_depth',50));max_pages=int(cfg.get('max_html_pages_per_run',50000))
-    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.3 (+GitHub Actions)')
+    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.8 (+GitHub Actions)')
     state=Path(cfg.get('state_dir','state'));out=Path(cfg.get('output_dir','output'));host=urlparse(target).netloc.lower().split(':')[0];db=state/f'{host_key(target)}.sqlite3'
-    if fresh and db.exists():db.unlink()
+    if fresh:
+        for fp in (db, Path(str(db)+'-wal'), Path(str(db)+'-shm')):
+            if fp.exists():
+                fp.unlink()
     con=init_db(db);add_many(con,[(target,'HTML','START',0)])
     headers={'User-Agent':ua,'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}
     async with aiohttp.ClientSession(headers=headers,connector=aiohttp.TCPConnector(limit=max(conc*2,8)),timeout=aiohttp.ClientTimeout(total=timeout)) as session:
         rp,robots_url,robots_loaded,robots_text=await get_robots(session,target,timeout)
         if not respect:robots_loaded=False
         print(f'Target URL      : {target}',flush=True);print(f'Collection mode : {collection}',flush=True);print(f'Output mode     : {mode}',flush=True);print(f'Concurrency     : {conc}',flush=True);print(f'Requests/sec    : {rps}',flush=True)
+        print(f'HTML/run limit  : {max_pages:,} pages',flush=True)
         if collection in ('AUTO','XML_ONLY'):
             files,sources=await discover_xml(session,target,robots_text,timeout,host,subs,keep,max_files)
-            add_many(con,[(u,'XML',sm,0) for u,sm in sources.items()]);print(f'[XML] sitemap_files={len(files):,} discovered={len(sources):,}',flush=True)
+            # IMPORTANT: XML URLs are always written to the cumulative URL table first.
+            # The per-run HTML limit applies only to HTML fetches, never to exported URL count.
+            add_many(con,[(u,'XML',sm,0) for u,sm in sources.items()])
+            con.commit()
+            print(f'[XML] sitemap_files={len(files):,} discovered={len(sources):,}',flush=True)
+            print(f'[XML] cumulative_unique={unique_count(con):,}',flush=True)
         if collection in ('AUTO','HTML_CRAWL'):
             base=f'{urlparse(target).scheme}://{urlparse(target).netloc}';seeds=[(target,0)]
             seeds += [(normalize_url(urljoin(base,p),keep),0) for p in COMMON_HTML_SITEMAPS if normalize_url(urljoin(base,p),keep)]
-            if collection=='AUTO':seeds += [(r[0],0) for r in con.execute("SELECT url FROM urls WHERE discovered_via='XML'").fetchall()]
+            if collection=='AUTO':
+                # Queue every URL currently known to the cumulative corpus.
+                # Existing html_queue rows are INSERT OR IGNORE, so already-finished pages stay finished.
+                seeds += [(r[0],0) for r in con.execute("SELECT url FROM urls").fetchall()]
             await html_discovery(session,con,seeds,host,subs,keep,timeout,rp,robots_loaded,ua,conc,rps,max_pages,max_depth)
         print_summary(con,'URL COLLECTION',unique_count(con),0)
         if mode=='DETAIL':
             print('STEP2: 保存済みURLの詳細情報を取得します。',flush=True)
             await detail_fetch(session,con,timeout,rp,robots_loaded,ua,conc,rps,max_pages);print_summary(con,'DETAIL')
+    print(f'[EXPORT] cumulative unique URLs = {unique_count(con):,}',flush=True)
     xlsx,csv=export_outputs(con,out,target,mode);print(f'Excel: {xlsx}',flush=True);print(f'CSV  : {csv}',flush=True);con.close()
 
 def main():
