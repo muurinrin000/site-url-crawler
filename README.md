@@ -235,3 +235,16 @@ XML取得を最優先で網羅するように強化しました。
 - v3.12のキャンセル安全終了、途中再開、完了済みstate自動削除、4モードは維持
 
 `XML_ONLY / XML_TITLE / AUTO` は、まずこのXML探索を完了してから次工程へ進みます。
+
+
+## v3.14 — XML探索 NameError 修正版
+
+v3.13 の `discover_xml()` 内で、実際の引数名と異なる `target` を参照して
+`NameError: name 'target' is not defined`
+が発生する不具合を修正しました。
+
+- XML完全探索の仕様は維持
+- robots.txt / sitemap index / 子XML・孫XMLの再帰探索を維持
+- `.xml.gz` 対応を維持
+- キャンセル安全終了・途中再開・完了済みstate自動削除を維持
+- 同じ変数名ミスを再発させないため、smoke check を追加
