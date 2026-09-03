@@ -1,7 +1,8 @@
+import time
 #!/usr/bin/env python3
 import argparse, asyncio, gzip, json, os, re, sqlite3, time
 from copy import copy
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
 from urllib.robotparser import RobotFileParser
@@ -157,6 +158,25 @@ async def get_html(session,url,sem,limiter,timeout,rp,robots_loaded,ua):
 
 def bar(p,w=10):
     n=max(0,min(w,round(w*p/100)));return '█'*n+'░'*(w-n)
+
+def format_duration(seconds):
+    if seconds is None or seconds < 0:
+        return "計算中"
+    seconds = int(round(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}時間{minutes:02d}分{secs:02d}秒"
+    if minutes:
+        return f"{minutes}分{secs:02d}秒"
+    return f"{secs}秒"
+
+def eta_clock(seconds):
+    if seconds is None or seconds < 0:
+        return "計算中"
+    now_jst = datetime.now(timezone.utc) + timedelta(hours=9)
+    return (now_jst + timedelta(seconds=seconds)).strftime("%H:%M頃")
+
 def print_summary(con,phase='',processed=None,remaining=None,started_at=None):
     x=via_count(con,'XML');h=via_count(con,'HTML');u=unique_count(con);d=meta_int(con,'duplicate_count')
     checked=con.execute("SELECT COUNT(*) FROM urls WHERE detail_status!='not_checked'").fetchone()[0]
@@ -273,7 +293,7 @@ async def run(cfg,fresh=False):
     if collection not in ('AUTO','XML_ONLY','HTML_CRAWL') or mode not in ('URL_ONLY','DETAIL'):raise SystemExit('Mode が不正です')
     timeout=int(cfg.get('timeout_seconds',25));max_files=int(cfg.get('max_sitemap_files',1000));subs=bool(cfg.get('include_subdomains',False))
     respect=bool(cfg.get('respect_robots_txt',True));max_depth=int(cfg.get('max_depth',50));max_pages=int(cfg.get('max_html_pages_per_run',50000))
-    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.8 (+GitHub Actions)')
+    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.9 (+GitHub Actions)')
     state=Path(cfg.get('state_dir','state'));out=Path(cfg.get('output_dir','output'));host=urlparse(target).netloc.lower().split(':')[0];db=state/f'{host_key(target)}.sqlite3'
     if fresh:
         for fp in (db, Path(str(db)+'-wal'), Path(str(db)+'-shm')):
