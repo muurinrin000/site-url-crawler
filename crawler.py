@@ -1,3 +1,4 @@
+import signal
 import time
 #!/usr/bin/env python3
 import argparse, asyncio, gzip, json, os, re, sqlite3, time
@@ -14,6 +15,23 @@ SKIP_EXTENSIONS={'.jpg','.jpeg','.png','.gif','.webp','.svg','.ico','.pdf','.zip
 TRACKING_PARAMS={'utm_source','utm_medium','utm_campaign','utm_term','utm_content','gclid','fbclid','yclid','msclkid'}
 COMMON_SITEMAPS=('/sitemap.xml','/sitemap_index.xml','/sitemap-index.xml','/sitemap/sitemap.xml')
 COMMON_HTML_SITEMAPS=('/sitemap/index.html','/sitemap.html','/sitemap/')
+
+CANCEL_REQUESTED = False
+
+def _request_cancel(signum, frame):
+    global CANCEL_REQUESTED
+    if not CANCEL_REQUESTED:
+        CANCEL_REQUESTED=True
+        print("\n[CANCEL] 終了要求を受信しました。新しいURL取得を停止し、再開用データを保存します。",flush=True)
+
+def install_signal_handlers():
+    for name in ("SIGTERM","SIGINT"):
+        sig=getattr(signal,name,None)
+        if sig is not None:
+            signal.signal(sig,_request_cancel)
+
+def cancellation_requested():
+    return CANCEL_REQUESTED
 
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def host_key(url): return re.sub(r'[^a-z0-9._-]+','_',urlparse(url).netloc.lower())
@@ -148,6 +166,7 @@ class RateLimiter:
     async def penalize(self,s):
         async with self.lock:self.penalty=max(self.penalty,time.monotonic()+s)
 async def get_html(session,url,sem,limiter,timeout,rp,robots_loaded,ua):
+    if cancellation_requested(): return None,None,'','cancelled','cancel requested'
     if robots_loaded and not rp.can_fetch(ua,url):return None,0,'','blocked','robots.txt'
     async with sem:
         await limiter.wait()
@@ -226,6 +245,22 @@ def print_summary(con,phase='',processed=None,remaining=None,started_at=None):
             print(f'完了予想            {eta_clock(eta)}' if eta is not None else '完了予想            計算中',flush=True)
     print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',flush=True)
 
+
+def write_completion_marker(host, collection_mode, complete, pending=0):
+    marker_dir=Path("run_meta")
+    marker_dir.mkdir(parents=True,exist_ok=True)
+    payload={
+        "host":host,
+        "collection_mode":collection_mode,
+        "complete":bool(complete),
+        "pending":int(pending or 0),
+        "finished_at":now_iso(),
+    }
+    (marker_dir/"completion.json").write_text(
+        json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8"
+    )
+
+
 def export_outputs(con,outdir,target,mode):
     outdir.mkdir(parents=True,exist_ok=True);key=host_key(target);df=pd.read_sql_query('SELECT * FROM urls ORDER BY rowid',con)
     if mode=='URL_ONLY':
@@ -254,6 +289,9 @@ async def html_discovery(session,con,seeds,host,subs,keep,timeout,rp,robots_load
     processed=0
     started_at=time.monotonic()
     while processed<max_pages:
+        if cancellation_requested():
+            print('[CANCEL] HTML巡回の新規処理を停止します。',flush=True)
+            break
         rows=con.execute(
             "SELECT url,depth FROM html_queue WHERE state='pending' ORDER BY rowid LIMIT ?",
             (min(conc*4,max_pages-processed),)
@@ -263,6 +301,8 @@ async def html_discovery(session,con,seeds,host,subs,keep,timeout,rp,robots_load
             get_html(session,u,sem,lim,timeout,rp,robots_loaded,ua) for u,d in rows
         ])
         for (u,d),(html,code,ct,state,err) in zip(rows,res):
+            if state=='cancelled':
+                continue
             con.execute("UPDATE html_queue SET state='done' WHERE url=?",(u,))
             processed+=1
             if html is not None:
@@ -304,6 +344,12 @@ async def title_fetch(session,con,urls,timeout,rp,robots_loaded,ua,conc,rps,max_
     started_at=time.monotonic()
 
     while processed<max_pages:
+
+        if cancellation_requested():
+
+            print('[CANCEL] タイトル取得の新規処理を停止します。',flush=True)
+
+            break
         rows=con.execute(
             "SELECT url FROM title_queue WHERE state='pending' ORDER BY rowid LIMIT ?",
             (min(conc*4,max_pages-processed),)
@@ -317,6 +363,8 @@ async def title_fetch(session,con,urls,timeout,rp,robots_loaded,ua,conc,rps,max_
         ])
 
         for u,(html,code,ct,state,err) in zip(page_urls,res):
+            if state=='cancelled':
+                continue
             con.execute("UPDATE title_queue SET state='done' WHERE url=?",(u,))
             processed+=1
             if html is not None:
@@ -359,12 +407,13 @@ async def detail_fetch(session,con,timeout,rp,robots_loaded,ua,conc,rps,max_page
     return processed
 
 async def run(cfg,fresh=False):
+    install_signal_handlers()
     keep=bool(cfg.get('keep_query',False));target=normalize_url(os.environ.get('TARGET_URL') or cfg['target_url'],keep)
     collection=(os.environ.get('COLLECTION_MODE') or 'AUTO').upper();mode=(os.environ.get('OUTPUT_MODE') or 'URL_ONLY').upper()
     if collection not in ('AUTO','XML_ONLY','XML_TITLE','HTML_CRAWL') or mode not in ('URL_ONLY','DETAIL'):raise SystemExit('Mode が不正です')
     timeout=int(cfg.get('timeout_seconds',25));max_files=int(cfg.get('max_sitemap_files',1000));subs=bool(cfg.get('include_subdomains',False))
     respect=bool(cfg.get('respect_robots_txt',True));max_depth=int(cfg.get('max_depth',50));max_pages=int(cfg.get('max_html_pages_per_run',50000))
-    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.10 (+GitHub Actions)')
+    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.12 (+GitHub Actions)')
     state=Path(cfg.get('state_dir','state'));out=Path(cfg.get('output_dir','output'));host=urlparse(target).netloc.lower().split(':')[0];db=state/f'{host_key(target)}.sqlite3'
     if fresh:
         for fp in (db, Path(str(db)+'-wal'), Path(str(db)+'-shm')):
@@ -405,6 +454,22 @@ async def run(cfg,fresh=False):
         if mode=='DETAIL':
             print('STEP2: 保存済みURLの詳細情報を取得します。',flush=True)
             await detail_fetch(session,con,timeout,rp,robots_loaded,ua,conc,rps,max_pages);print_summary(con,'DETAIL')
+    # Keep state only while resumable work remains.
+    if collection=='XML_ONLY':
+        pending_work=0
+        crawl_complete=True
+    elif collection=='XML_TITLE':
+        pending_work=con.execute("SELECT COUNT(*) FROM title_queue WHERE state='pending'").fetchone()[0]
+        crawl_complete=(pending_work==0)
+    else:
+        pending_work=con.execute("SELECT COUNT(*) FROM html_queue WHERE state='pending'").fetchone()[0]
+        crawl_complete=(pending_work==0)
+
+    if cancellation_requested():
+        crawl_complete=False
+        print('[CANCEL] 再開用stateを保持します。',flush=True)
+    write_completion_marker(host,collection,crawl_complete,pending_work)
+    print(f'[STATE] complete={crawl_complete} pending={pending_work:,}',flush=True)
     print(f'[EXPORT] cumulative unique URLs = {unique_count(con):,}',flush=True)
     xlsx,csv=export_outputs(con,out,target,mode);print(f'Excel: {xlsx}',flush=True);print(f'CSV  : {csv}',flush=True);con.close()
 

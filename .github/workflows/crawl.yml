@@ -171,17 +171,56 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Save crawl state
+      - name: Save or clean crawl state
         if: always()
         shell: bash
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state/
+
+          HOST=$(python - <<'PY'
+          from urllib.parse import urlparse
+          import os
+          print(urlparse(os.environ["TARGET_URL"].strip()).netloc.lower().split(":")[0] or "site")
+          PY
+          )
+
+          COMPLETE=$(python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path("run_meta/completion.json")
+          if not p.exists():
+              print("unknown")
+          else:
+              try:
+                  print("true" if json.loads(p.read_text(encoding="utf-8")).get("complete") else "false")
+              except Exception:
+                  print("unknown")
+          PY
+          )
+
+          if [ "$COMPLETE" = "true" ]; then
+            echo "Completed: deleting resume state for ${HOST}."
+            rm -f "state/${HOST}.sqlite3" "state/${HOST}.sqlite3-wal" "state/${HOST}.sqlite3-shm"
+          elif [ "$COMPLETE" = "false" ]; then
+            echo "Incomplete: keeping resume state for ${HOST}."
+          else
+            echo "Completion unknown: keeping state if present."
+          fi
+
+          git add -A state/
           if git diff --cached --quiet; then
             echo "No state changes to save."
             exit 0
           fi
-          git commit -m "Update crawl state"
+
+          if [ "$COMPLETE" = "true" ]; then
+            git commit -m "Clean completed crawl state: ${HOST}"
+          else
+            git commit -m "Update crawl state: ${HOST}"
+          fi
+
           git pull --rebase origin main || true
           git push origin HEAD:main

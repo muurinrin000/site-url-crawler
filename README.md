@@ -201,3 +201,19 @@ XMLを使わず、トップページ・HTMLサイトマップ等から内部リ�
 
 ActionsのCollection mode初期値は `XML_TITLE` に変更しています。
 `XML_ONLY / XML_TITLE / AUTO` ではXML一覧Artifactを先にダウンロードできます。
+
+
+## v3.11 — 完了済みstateの自動削除
+
+途中のサイトだけ再開用SQLiteを保持し、完了済みサイトのstateはGitHubリポジトリから自動削除します。
+
+- XML_TITLE: title_queue が0件なら削除
+- AUTO / HTML_CRAWL: html_queue が0件なら削除
+- 未処理が残る場合: stateを保存し Fresh start=OFF で再開可能
+- XML_ONLY: 再開不要なので完了扱い
+- 予期しないエラーで完了判定できない場合: stateを残す
+- ArtifactのExcel/CSVは従来どおり30日保持
+
+
+## v3.12 — キャンセル時の安全終了
+GitHub Actionsの終了要求を検知すると、新しいURL取得を止め、未処理URLをpendingのまま残し、再開用stateを保持します。次回は同じTarget URL・同じCollection mode・Fresh start=OFFで再開できます。
