@@ -11,11 +11,12 @@ on:
       collection_mode:
         description: "Collection mode"
         required: true
-        default: "AUTO"
+        default: "XML_TITLE"
         type: choice
         options:
-          - AUTO
           - XML_ONLY
+          - XML_TITLE
+          - AUTO
           - HTML_CRAWL
       output_mode:
         description: "Output mode"
@@ -50,7 +51,7 @@ concurrency:
 
 jobs:
   xml-preview:
-    if: ${{ inputs.collection_mode == 'AUTO' || inputs.collection_mode == 'XML_ONLY' }}
+    if: ${{ inputs.collection_mode == 'XML_ONLY' || inputs.collection_mode == 'XML_TITLE' || inputs.collection_mode == 'AUTO' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -97,7 +98,7 @@ jobs:
           mkdir -p xml_preview_download
           cp "preview_output/${HOST}_url_only.xlsx" xml_preview_download/
           cp "preview_output/${HOST}_url_only.csv" xml_preview_download/
-          echo "artifact_name=${HOST}_XML発見URL_速報版" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${HOST}_XML発見URL" >> "$GITHUB_OUTPUT"
 
       - name: Upload XML-only Excel / CSV
         uses: actions/upload-artifact@v4
@@ -146,6 +147,7 @@ jobs:
         env:
           TARGET_URL: ${{ inputs.target_url }}
           OUTPUT_MODE: ${{ inputs.output_mode }}
+          COLLECTION_MODE: ${{ inputs.collection_mode }}
         run: |
           HOST=$(python - <<'PY'
           from urllib.parse import urlparse
@@ -158,7 +160,7 @@ jobs:
           mkdir -p run_output
           cp "output/${HOST}_${MODE}.xlsx" run_output/ 2>/dev/null || true
           cp "output/${HOST}_${MODE}.csv" run_output/ 2>/dev/null || true
-          echo "artifact_name=${HOST}_URL調査結果" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${HOST}_${COLLECTION_MODE}_URL調査結果" >> "$GITHUB_OUTPUT"
 
       - name: Upload Excel / CSV
         if: always()

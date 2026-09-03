@@ -53,6 +53,10 @@ def init_db(path):
         depth INTEGER NOT NULL DEFAULT 0,
         state TEXT NOT NULL DEFAULT 'pending'
     )''')
+    con.execute('''CREATE TABLE IF NOT EXISTS title_queue(
+        url TEXT PRIMARY KEY,
+        state TEXT NOT NULL DEFAULT 'pending'
+    )''')
     con.commit(); return con
 def meta_int(con,key):
     r=con.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone(); return int(r[0]) if r else 0
@@ -190,6 +194,20 @@ def print_summary(con,phase='',processed=None,remaining=None,started_at=None):
         pct=checked/max(u,1)*100
         print(f'詳細取得済み        {checked:>8,} URL',flush=True)
         print(f'進捗  {bar(pct)}  {pct:5.1f}%',flush=True)
+    elif phase=='XML TITLE' and processed is not None:
+        rem=max(0,remaining or 0)
+        pct=processed/max(processed+rem,1)*100
+        print(f'今回タイトル取得    {processed:>8,} ページ',flush=True)
+        print(f'タイトル取得待ち    {rem:>8,} ページ',flush=True)
+        print(f'進捗  {bar(pct)}  {pct:5.1f}%',flush=True)
+        if started_at is not None:
+            elapsed=max(time.monotonic()-started_at,0.001)
+            speed=processed/elapsed if processed>0 else 0.0
+            eta=(rem/speed) if speed>0 else None
+            print(f'経過時間            {format_duration(elapsed)}',flush=True)
+            print(f'処理速度            {speed:.2f} ページ/秒',flush=True)
+            print(f'残り時間の目安      約{format_duration(eta)}' if eta is not None else '残り時間の目安      計算中',flush=True)
+            print(f'完了予想            {eta_clock(eta)}' if eta is not None else '完了予想            計算中',flush=True)
     elif processed is not None:
         # URL_ONLY/AUTOのHTML探索は巡回中に新URLが増えるため、
         # 現時点の処理済み＋待機中を分母とした動的な進捗率。
@@ -273,6 +291,59 @@ async def html_discovery(session,con,seeds,host,subs,keep,timeout,rp,robots_load
         print('HTML巡回は完了しました。',flush=True)
     return processed
 
+
+async def title_fetch(session,con,urls,timeout,rp,robots_loaded,ua,conc,rps,max_pages):
+    sem=asyncio.Semaphore(conc);lim=RateLimiter(rps)
+
+    # XMLで見つかったURLだけをタイトル取得対象にする。
+    for u in urls:
+        con.execute("INSERT OR IGNORE INTO title_queue(url,state) VALUES(?,'pending')",(u,))
+    con.commit()
+
+    processed=0
+    started_at=time.monotonic()
+
+    while processed<max_pages:
+        rows=con.execute(
+            "SELECT url FROM title_queue WHERE state='pending' ORDER BY rowid LIMIT ?",
+            (min(conc*4,max_pages-processed),)
+        ).fetchall()
+        if not rows:
+            break
+
+        page_urls=[r[0] for r in rows]
+        res=await asyncio.gather(*[
+            get_html(session,u,sem,lim,timeout,rp,robots_loaded,ua) for u in page_urls
+        ])
+
+        for u,(html,code,ct,state,err) in zip(page_urls,res):
+            con.execute("UPDATE title_queue SET state='done' WHERE url=?",(u,))
+            processed+=1
+            if html is not None:
+                con.execute(
+                    "UPDATE urls SET title=?,status_code=?,content_type=?,fetched_at=?,error=? WHERE url=?",
+                    (extract_title(html),code,ct,now_iso(),err,u)
+                )
+            else:
+                con.execute(
+                    "UPDATE urls SET status_code=?,content_type=?,fetched_at=?,error=? WHERE url=?",
+                    (code,ct,now_iso(),err,u)
+                )
+            con.commit()
+
+        pending=con.execute("SELECT COUNT(*) FROM title_queue WHERE state='pending'").fetchone()[0]
+        if processed%100<len(rows):
+            print_summary(con,'XML TITLE',processed,pending,started_at)
+
+    pending=con.execute("SELECT COUNT(*) FROM title_queue WHERE state='pending'").fetchone()[0]
+    print_summary(con,'XML TITLE',processed,pending,started_at)
+    if pending:
+        print(f'今回のタイトル取得上限に到達。残り {pending:,} ページは Fresh start OFF で続きから再開できます。',flush=True)
+    else:
+        print('XML掲載URLのタイトル取得は完了しました。',flush=True)
+    return processed
+
+
 async def detail_fetch(session,con,timeout,rp,robots_loaded,ua,conc,rps,max_pages):
     sem=asyncio.Semaphore(conc);lim=RateLimiter(rps);processed=0
     while processed<max_pages:
@@ -290,10 +361,10 @@ async def detail_fetch(session,con,timeout,rp,robots_loaded,ua,conc,rps,max_page
 async def run(cfg,fresh=False):
     keep=bool(cfg.get('keep_query',False));target=normalize_url(os.environ.get('TARGET_URL') or cfg['target_url'],keep)
     collection=(os.environ.get('COLLECTION_MODE') or 'AUTO').upper();mode=(os.environ.get('OUTPUT_MODE') or 'URL_ONLY').upper()
-    if collection not in ('AUTO','XML_ONLY','HTML_CRAWL') or mode not in ('URL_ONLY','DETAIL'):raise SystemExit('Mode が不正です')
+    if collection not in ('AUTO','XML_ONLY','XML_TITLE','HTML_CRAWL') or mode not in ('URL_ONLY','DETAIL'):raise SystemExit('Mode が不正です')
     timeout=int(cfg.get('timeout_seconds',25));max_files=int(cfg.get('max_sitemap_files',1000));subs=bool(cfg.get('include_subdomains',False))
     respect=bool(cfg.get('respect_robots_txt',True));max_depth=int(cfg.get('max_depth',50));max_pages=int(cfg.get('max_html_pages_per_run',50000))
-    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.9 (+GitHub Actions)')
+    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.10 (+GitHub Actions)')
     state=Path(cfg.get('state_dir','state'));out=Path(cfg.get('output_dir','output'));host=urlparse(target).netloc.lower().split(':')[0];db=state/f'{host_key(target)}.sqlite3'
     if fresh:
         for fp in (db, Path(str(db)+'-wal'), Path(str(db)+'-shm')):
@@ -305,15 +376,23 @@ async def run(cfg,fresh=False):
         rp,robots_url,robots_loaded,robots_text=await get_robots(session,target,timeout)
         if not respect:robots_loaded=False
         print(f'Target URL      : {target}',flush=True);print(f'Collection mode : {collection}',flush=True);print(f'Output mode     : {mode}',flush=True);print(f'Concurrency     : {conc}',flush=True);print(f'Requests/sec    : {rps}',flush=True)
-        print(f'HTML/run limit  : {max_pages:,} pages',flush=True)
-        if collection in ('AUTO','XML_ONLY'):
+        print(f'Page/run limit  : {max_pages:,} pages',flush=True)
+        xml_sources={}
+        if collection in ('AUTO','XML_ONLY','XML_TITLE'):
             files,sources=await discover_xml(session,target,robots_text,timeout,host,subs,keep,max_files)
+            xml_sources=sources
             # IMPORTANT: XML URLs are always written to the cumulative URL table first.
             # The per-run HTML limit applies only to HTML fetches, never to exported URL count.
             add_many(con,[(u,'XML',sm,0) for u,sm in sources.items()])
             con.commit()
             print(f'[XML] sitemap_files={len(files):,} discovered={len(sources):,}',flush=True)
             print(f'[XML] cumulative_unique={unique_count(con):,}',flush=True)
+        if collection=='XML_TITLE':
+            print('STEP2: XML掲載URLだけのページタイトルを取得します。内部リンク探索は行いません。',flush=True)
+            await title_fetch(
+                session,con,list(xml_sources.keys()),timeout,rp,robots_loaded,ua,
+                conc,rps,max_pages
+            )
         if collection in ('AUTO','HTML_CRAWL'):
             base=f'{urlparse(target).scheme}://{urlparse(target).netloc}';seeds=[(target,0)]
             seeds += [(normalize_url(urljoin(base,p),keep),0) for p in COMMON_HTML_SITEMAPS if normalize_url(urljoin(base,p),keep)]
