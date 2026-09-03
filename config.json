@@ -1,0 +1,21 @@
+{
+  "target_url": "https://www.insource.co.jp/",
+  "max_pages_per_run": 5000,
+  "delay_seconds": 0.7,
+  "timeout_seconds": 20,
+  "save_every": 50,
+  "max_depth": 50,
+  "include_subdomains": false,
+  "keep_query": false,
+  "respect_robots_txt": true,
+  "user_agent": "SiteURLCrawler/1.0 (+GitHub Actions)",
+  "exclude_url_regex": [
+    "/wp-admin/",
+    "/login",
+    "/logout",
+    "/cart",
+    "/checkout"
+  ],
+  "state_dir": "state",
+  "output_dir": "output"
+}
