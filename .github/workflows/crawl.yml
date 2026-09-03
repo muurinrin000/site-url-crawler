@@ -1,0 +1,75 @@
+name: Crawl site URLs
+
+on:
+  workflow_dispatch:
+    inputs:
+      fresh_start:
+        description: "最初からクロールし直す"
+        required: true
+        type: boolean
+        default: false
+  schedule:
+    # 任意。不要ならこの2行を削除してください。
+    - cron: "20 18 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: site-url-crawler
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Crawl
+        shell: bash
+        run: |
+          if [ "${{ github.event.inputs.fresh_start }}" = "true" ]; then
+            python crawler.py --config config.json --fresh
+          else
+            python crawler.py --config config.json
+          fi
+
+      - name: Upload Excel / CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-output-${{ github.run_number }}
+          path: |
+            output/*.xlsx
+            output/*.csv
+            output/*.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Save crawl state and latest output to repository
+        if: always()
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state output
+          if git diff --cached --quiet; then
+            echo "No crawl changes to commit."
+          else
+            git commit -m "chore: save crawl progress [skip ci]"
+            git push
+          fi
