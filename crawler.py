@@ -128,7 +128,7 @@ async def discover_xml(session,start,robots,timeout,host,subs,keep,max_files):
     candidates=[]
 
     # Sitemap declarations in robots.txt.
-    for line in (robots_text or "").splitlines():
+    for line in (robots or "").splitlines():
         if line.lower().startswith("sitemap:"):
             u=line.split(":",1)[1].strip()
             if u:
@@ -159,7 +159,7 @@ async def discover_xml(session,start,robots,timeout,host,subs,keep,max_files):
         pu=urlparse(u)
         if pu.scheme not in ("http","https"):
             return
-        # Sitemap files must remain on the target host unless subdomains are allowed.
+        # Sitemap files must remain on the start host unless subdomains are allowed.
         if not same_host(u,host,subs):
             return
         if u not in queued and u not in visited:
@@ -544,7 +544,7 @@ async def run(cfg,fresh=False):
     if collection not in ('AUTO','XML_ONLY','XML_TITLE','HTML_CRAWL') or mode not in ('URL_ONLY','DETAIL'):raise SystemExit('Mode が不正です')
     timeout=int(cfg.get('timeout_seconds',25));max_files=int(cfg.get('max_sitemap_files',1000));subs=bool(cfg.get('include_subdomains',False))
     respect=bool(cfg.get('respect_robots_txt',True));max_depth=int(cfg.get('max_depth',50));max_pages=int(cfg.get('max_html_pages_per_run',50000))
-    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.14 (+GitHub Actions)')
+    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.15 (+GitHub Actions)')
     state=Path(cfg.get('state_dir','state'));out=Path(cfg.get('output_dir','output'));host=urlparse(target).netloc.lower().split(':')[0];db=state/f'{host_key(target)}.sqlite3'
     if fresh:
         for fp in (db, Path(str(db)+'-wal'), Path(str(db)+'-shm')):

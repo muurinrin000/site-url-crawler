@@ -248,3 +248,16 @@ v3.13 の `discover_xml()` 内で、実際の引数名と異なる `target` を�
 - `.xml.gz` 対応を維持
 - キャンセル安全終了・途中再開・完了済みstate自動削除を維持
 - 同じ変数名ミスを再発させないため、smoke check を追加
+
+
+## v3.15 — XML探索の引数名不整合修正版
+
+v3.14で発生した
+`NameError: name 'robots_text' is not defined`
+を修正しました。
+
+`discover_xml()` 内の `target / robots_text / timeout / host / subs / keep / max_files`
+について、関数が実際に受け取っている引数名に統一しています。
+
+XML完全探索、子XML・孫XMLの再帰探索、XML_TITLE、AUTO、
+キャンセル安全終了、途中再開、完了済みstate自動削除は維持しています。
