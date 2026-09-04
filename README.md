@@ -213,3 +213,21 @@ ActionsのCollection mode初期値は `XML_TITLE` に変更しています。
 - XML_ONLY: 再開不要なので完了扱い
 - 予期しないエラーで完了判定できない場合: stateを残す
 - ArtifactのExcel/CSVは従来どおり30日保持
+
+
+## v3.12-stable — v3.11安定版ベース / XML速報修正版
+
+v3.11「完了済みstate自動削除版」をベースに、XML部分だけ最小限修正しました。
+
+### 修正内容
+- Sitemap Index を親XMLとして認識し、子XML・孫XML以降を再帰的に展開
+- 子XML取得は一時的な通信失敗に備えて最大3回リトライ
+- XMLごとに `[XML][INDEX]` / `[XML][URLSET]` / `[XML][FAIL]` をログ表示
+- XML_ONLY / XML_TITLE では開始URLを「HTML 1件」として混ぜない
+- XML_ONLY / XML_TITLE でXMLページURLが0件なら、1URLだけの誤った速報版を作らずエラーとして明示
+- sitemapファイル安全上限を5,000へ拡大
+- v3.11の4モード、タイトル取得、途中再開、完了済みstate自動削除は維持
+
+STS-Dのような
+`sitemap.xml -> sitemap-misc.xml / blog-sitemap.xml / post-sitemap.xml / page-sitemap.xml ...`
+という形式では、最初のXML速報版の時点で子XML内のページURLをすべて統合して出力します。

@@ -95,29 +95,86 @@ def parse_xml(data,url):
     root=DET.fromstring(data);kind=root.tag.rsplit('}',1)[-1].lower()
     return kind,[e.text.strip() for e in root.iter() if e.tag.rsplit('}',1)[-1].lower()=='loc' and e.text]
 async def discover_xml(session,start,robots,timeout,host,subs,keep,max_files):
-    base=f'{urlparse(start).scheme}://{urlparse(start).netloc}';q=[]
+    """
+    v3.11 stable-base XML discovery:
+    - robots.txt Sitemap entries + common sitemap entry points
+    - recursively expands sitemapindex -> child sitemap -> grandchildren...
+    - retries transient failures up to 3 times
+    - returns only page URLs from urlset files
+    """
+    base=f'{urlparse(start).scheme}://{urlparse(start).netloc}'
+    q=[]
     for u in robots_sitemaps(robots)+[urljoin(base,p) for p in COMMON_SITEMAPS]:
         n=normalize_url(u,True)
-        if n and n not in q:q.append(n)
-    seen=set();files=[];sources={}
+        if n and n not in q:
+            q.append(n)
+
+    seen=set()
+    files=[]
+    sources={}
+    failed=[]
+
+    async def fetch_sitemap(sm):
+        last_err=None
+        for attempt in range(1,4):
+            try:
+                r,b=await fetch(session,sm,timeout)
+                if r.status < 400:
+                    return r,b,None
+                last_err=f'HTTP {r.status}'
+            except Exception as e:
+                last_err=str(e)
+            if attempt < 3:
+                await asyncio.sleep(attempt * 1.5)
+        return None,None,last_err or 'unknown error'
+
     while q and len(seen)<max_files:
         sm=q.pop(0)
-        if sm in seen:continue
+        if sm in seen:
+            continue
         seen.add(sm)
+
+        r,b,err=await fetch_sitemap(sm)
+        if err:
+            failed.append((sm,err))
+            print(f'[XML][FAIL] {sm} :: {err}',flush=True)
+            continue
+
         try:
-            r,b=await fetch(session,sm,timeout)
-            if r.status>=400:continue
             kind,locs=parse_xml(b,sm)
-        except:continue
+        except Exception as e:
+            failed.append((sm,f'parse error: {e}'))
+            print(f'[XML][FAIL] {sm} :: parse error: {e}',flush=True)
+            continue
+
         files.append(sm)
+
         if kind=='sitemapindex':
+            added_children=0
             for loc in locs:
                 n=normalize_url(loc,True)
-                if n and n not in seen:q.append(n)
+                if n and n not in seen and n not in q:
+                    q.append(n)
+                    added_children+=1
+            print(f'[XML][INDEX] {sm} -> child sitemaps={len(locs):,} / newly queued={added_children:,}',flush=True)
+
         elif kind=='urlset':
+            added_urls=0
             for loc in locs:
                 n=normalize_url(loc,keep)
-                if n and same_site(n,host,subs) and not skipped_extension(n):sources.setdefault(n,sm)
+                if n and same_site(n,host,subs) and not skipped_extension(n):
+                    if n not in sources:
+                        added_urls+=1
+                    sources.setdefault(n,sm)
+            print(f'[XML][URLSET] {sm} -> URLs={len(locs):,} / new={added_urls:,} / total={len(sources):,}',flush=True)
+
+        else:
+            print(f'[XML][SKIP] {sm} :: root={kind}',flush=True)
+
+    if q:
+        print(f'[XML][WARN] sitemap file limit reached: {max_files:,}; remaining={len(q):,}',flush=True)
+
+    print(f'[XML] sitemap_files={len(files):,} / failed={len(failed):,} / unique_page_urls={len(sources):,}',flush=True)
     return files,sources
 
 def extract_links(html,base,host,subs,keep):
@@ -380,13 +437,17 @@ async def run(cfg,fresh=False):
     if collection not in ('AUTO','XML_ONLY','XML_TITLE','HTML_CRAWL') or mode not in ('URL_ONLY','DETAIL'):raise SystemExit('Mode が不正です')
     timeout=int(cfg.get('timeout_seconds',25));max_files=int(cfg.get('max_sitemap_files',1000));subs=bool(cfg.get('include_subdomains',False))
     respect=bool(cfg.get('respect_robots_txt',True));max_depth=int(cfg.get('max_depth',50));max_pages=int(cfg.get('max_html_pages_per_run',50000))
-    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.11 (+GitHub Actions)')
+    conc=max(1,int(os.environ.get('CONCURRENCY') or cfg.get('concurrency',6)));rps=max(0.1,float(os.environ.get('REQUESTS_PER_SECOND') or cfg.get('requests_per_second',1.5)));ua=cfg.get('user_agent','SiteURLCollector/3.12-stable (+GitHub Actions)')
     state=Path(cfg.get('state_dir','state'));out=Path(cfg.get('output_dir','output'));host=urlparse(target).netloc.lower().split(':')[0];db=state/f'{host_key(target)}.sqlite3'
     if fresh:
         for fp in (db, Path(str(db)+'-wal'), Path(str(db)+'-shm')):
             if fp.exists():
                 fp.unlink()
-    con=init_db(db);add_many(con,[(target,'HTML','START',0)])
+    con=init_db(db)
+    # XML_ONLY / XML_TITLE はXML掲載URLだけを出力する。
+    # AUTO / HTML_CRAWL のときだけ開始URLをHTML探索用に登録する。
+    if collection in ('AUTO','HTML_CRAWL'):
+        add_many(con,[(target,'HTML','START',0)])
     headers={'User-Agent':ua,'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}
     async with aiohttp.ClientSession(headers=headers,connector=aiohttp.TCPConnector(limit=max(conc*2,8)),timeout=aiohttp.ClientTimeout(total=timeout)) as session:
         rp,robots_url,robots_loaded,robots_text=await get_robots(session,target,timeout)
@@ -403,6 +464,14 @@ async def run(cfg,fresh=False):
             con.commit()
             print(f'[XML] sitemap_files={len(files):,} discovered={len(sources):,}',flush=True)
             print(f'[XML] cumulative_unique={unique_count(con):,}',flush=True)
+
+            # XML_ONLY / XML_TITLE で0件なら、空のXML結果を成功扱いにしない。
+            # これにより開始URL1件だけの「XML速報版」が出ることを防ぐ。
+            if collection in ('XML_ONLY','XML_TITLE') and not sources:
+                raise RuntimeError(
+                    'XMLサイトマップからページURLを1件も取得できませんでした。'
+                    '一時的な取得失敗の可能性があります。ログの [XML][FAIL] を確認してください。'
+                )
         if collection=='XML_TITLE':
             print('STEP2: XML掲載URLだけのページタイトルを取得します。内部リンク探索は行いません。',flush=True)
             await title_fetch(
